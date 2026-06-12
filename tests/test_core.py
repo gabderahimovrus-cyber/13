@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import Agent, AppState, Message, StateStore, AgentEngine, OllamaClient
+from main import Agent, AppState, Message, StateStore, AgentEngine, LocalKeyCipher, ModelManager, ModelSelection, OllamaClient
 
 
 class CoreTests(unittest.TestCase):
@@ -20,12 +20,14 @@ class CoreTests(unittest.TestCase):
             agent.remember_event("важное событие")
             message = Message(sender="Пользователь", recipient="Все", text="Привет")
             agent.remember_message(message)
-            state = AppState(agents=[agent], messages=[message], selected_global_model="llama3.1", paused=False)
+            state = AppState(agents=[agent], messages=[message], selected_global_model="llama3.1", selected_global_provider="ollama", paused=False)
 
             store.save(state)
             loaded = store.load()
 
             self.assertEqual(loaded.selected_global_model, "llama3.1")
+            self.assertEqual(loaded.selected_global_provider, "ollama")
+            self.assertTrue(any(provider.id == "openai" for provider in loaded.providers))
             self.assertFalse(loaded.paused)
             self.assertEqual(loaded.agents[0].name, "Тестовый агент")
             self.assertEqual(loaded.agents[0].short_term_memory[0].text, "Привет")
@@ -40,12 +42,39 @@ class CoreTests(unittest.TestCase):
 
     def test_engine_parses_json_embedded_in_markdown(self):
         state = AppState()
-        engine = AgentEngine(state, OllamaClient(), threading_lock_for_tests(), lambda _: None, lambda: None)
+        engine = AgentEngine(state, ModelManager(state, OllamaClient()), threading_lock_for_tests(), lambda _: None, lambda: None)
 
         parsed = engine._parse_agent_response('```json\n{"respond": false, "message": "", "recipient": "Все"}\n```')
 
         self.assertFalse(parsed["respond"])
         self.assertEqual(parsed["recipient"], "Все")
+
+    def test_local_key_cipher_round_trip_hides_plaintext(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cipher = LocalKeyCipher(Path(tmp) / "secret")
+            encrypted = cipher.encrypt("sk-test-secret")
+
+            self.assertNotIn("sk-test-secret", encrypted)
+            self.assertEqual(cipher.decrypt(encrypted), "sk-test-secret")
+
+    def test_model_manager_falls_back_to_secondary_model(self):
+        class FakeProvider:
+            def __init__(self, name):
+                self.name = name
+
+            def generate(self, model, prompt):
+                if self.name == "primary":
+                    raise RuntimeError("primary down")
+                return f"{self.name}:{model}:{prompt}"
+
+        state = AppState()
+        manager = ModelManager(state, OllamaClient())
+        manager.provider = lambda provider_id: FakeProvider(provider_id)  # type: ignore[method-assign]
+
+        text, used = manager.generate(ModelSelection("primary", "m1"), "ping", ModelSelection("fallback", "m2"))
+
+        self.assertEqual(text, "fallback:m2:ping")
+        self.assertEqual(used, ModelSelection("fallback", "m2"))
 
 
 def threading_lock_for_tests():
